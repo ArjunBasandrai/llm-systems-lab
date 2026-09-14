@@ -1,11 +1,11 @@
 from collections import Counter
 import json
 from pathlib import Path
-import re
 import time
 from datetime import datetime, timezone
 
 from tqdm import tqdm
+import regex
 
 
 class BPETokenizer:
@@ -20,20 +20,23 @@ class BPETokenizer:
         self.training_text_bytes: int | None = None
 
     def __pre_tokenize(self, text: str) -> list[bytes]:
-        lines = text.splitlines(keepends=True)
-        subsequences = []
+        pattern = regex.compile(
+            r" ?\p{L}+(?:['’]\p{L}+)*"
+            r"| ?\p{N}+"
+            r"| ?[^\s\p{L}\p{N}]+"
+            r"|\s+"
+        )
 
-        for line in lines:
-            parts = re.findall(r'[^.;:!?]*[.;:!?]+|[^.;:!?]+', line)
-            subsequences.extend(parts)
+        parts = pattern.findall(text)
 
-        return [s.encode("utf-8") for s in subsequences]
+        return [part.encode("utf-8") for part in parts]
 
-    def __count_pairs(self, sequences: list[list[int]]) -> Counter:
+    def __count_pairs(self, sequences: list[list[int]], frequencies: list[int]) -> Counter:
         counter = Counter()
 
-        for seq in sequences:
-            counter.update(zip(seq, seq[1:]))
+        for seq, frequency in zip(sequences, frequencies):
+            for pair in zip(seq, seq[1:]):
+                counter[pair] += frequency
 
         return counter
 
@@ -63,7 +66,12 @@ class BPETokenizer:
         start_time = time.perf_counter()
 
         byte_sequences = self.__pre_tokenize(text)
-        sequences = [list(seq) for seq in byte_sequences]
+        chunk_counts = Counter(byte_sequences)
+
+        items = list(chunk_counts.items())
+
+        sequences = [list(chunk) for chunk, _ in items]
+        frequencies = [frequency for _, frequency in items]
 
         self.training_text_bytes = len(text.encode("utf-8"))
 
@@ -73,7 +81,7 @@ class BPETokenizer:
             unit="tokens",
         ) as pbar:
             while len(self.vocab) < self.vocab_size:
-                pair_counts = self.__count_pairs(sequences)
+                pair_counts = self.__count_pairs(sequences, frequencies)
 
                 if not pair_counts:
                     break
