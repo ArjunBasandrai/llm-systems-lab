@@ -1723,5 +1723,13 @@
       289,
       499
     ]
-  ]
+  ],
+  "metadata": {
+    "training_time_seconds": 1128.5552872999979,
+    "training_text_bytes": 10485760,
+    "num_merges": 244,
+    "actual_vocab_size": 500,
+    "saved_at": "2026-09-14T02:34:47.685221+00:00",
+    "format_version": 1
+  }
 }
