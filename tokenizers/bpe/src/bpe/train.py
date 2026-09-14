@@ -2,23 +2,31 @@ from pathlib import Path
 
 from bpe.bpe import BPETokenizer
 
+DATASET_NAME = "fineweb"
+VOCAB_SIZE = 32_768
+DATA_PATH = Path(f"../data/{DATASET_NAME}-2gb.txt")
+MODEL_PATH = Path(f"models/{DATASET_NAME}-bpe-{VOCAB_SIZE}.json")
 
-DATA_PATH = Path("../data/wikitext-10mb.txt")
-VOCAB_SIZE = 8000
+def main() -> None:
+    tokenizer = BPETokenizer(
+        vocab_size=VOCAB_SIZE,
+        encode_cache_size=100_000,
+    )
 
+    tokenizer.train_file(DATA_PATH)
+    tokenizer.save(MODEL_PATH)
 
-def load_training_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    print()
+    print(f"Saved tokenizer to: {MODEL_PATH}")
+    print(f"Vocabulary size:    {len(tokenizer.vocab):,}")
+    print(f"Learned merges:     {len(tokenizer.merges):,}")
 
+    if tokenizer.training_time is not None:
+        print(
+            f"Training time:      "
+            f"{tokenizer.training_time / 60:.2f} min"
+        )
 
-def main():
-    text = load_training_text(DATA_PATH)
-
-    tokenizer = BPETokenizer(vocab_size=VOCAB_SIZE)
-
-    tokenizer.train(text)
-
-    tokenizer.save(f"models/wikitext-bpe-{VOCAB_SIZE}.json")
 
 if __name__ == "__main__":
     main()

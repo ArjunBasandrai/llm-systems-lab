@@ -16,7 +16,8 @@ dependencies = [
 [project.scripts]
 train = "bpe.train:main"
 test = "bpe.test:main"
-data = "bpe.data:main"
+wikitext = "bpe.data_wikitext:main"
+fineweb = "bpe.data_fineweb:main"
 
 [build-system]
 requires = ["uv_build>=0.12.6,<0.13.0"]
