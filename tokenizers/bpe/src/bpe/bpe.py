@@ -16,6 +16,8 @@ class BPETokenizer:
         }
         self.merges: dict[tuple[int, int], int] = {}
 
+        self.merge_ranks: dict[tuple[int, int], int] = {}
+
         self.training_time: float | None = None
         self.training_text_bytes: int | None = None
 
@@ -61,6 +63,42 @@ class BPETokenizer:
                 i += 1
 
         return merged_sequence
+
+    def __rebuild_merge_ranks(self) -> None:
+        self.merge_ranks = {
+            pair: rank
+            for rank, pair in enumerate(self.merges)
+        }
+
+    def __encode_chunk(self, chunk: bytes) -> list[int]:
+        sequence = list(chunk)
+
+        while len(sequence) >= 2:
+            best_pair = None
+            best_rank = None
+
+            for pair in zip(sequence, sequence[1:]):
+                rank = self.merge_ranks.get(pair)
+
+                if rank is None:
+                    continue
+
+                if best_rank is None or rank < best_rank:
+                    best_pair = pair
+                    best_rank = rank
+
+            if best_pair is None:
+                break
+
+            new_token_id = self.merges[best_pair]
+
+            sequence = self.__merge_pair(
+                sequence,
+                best_pair,
+                new_token_id,
+            )
+
+        return sequence
 
     def train(self, text: str) -> None:
         start_time = time.perf_counter()
@@ -110,21 +148,15 @@ class BPETokenizer:
 
     def encode(self, text: str) -> list[int]:
         byte_sequences = self.__pre_tokenize(text)
-        sequences = [list(seq) for seq in byte_sequences]
 
-        for pair, new_token_id in self.merges.items():
-            for i in range(len(sequences)):
-                sequences[i] = self.__merge_pair(
-                    sequences[i],
-                    pair,
-                    new_token_id,
-                )
+        encoded: list[int] = []
 
-        return [
-            token_id
-            for seq in sequences
-            for token_id in seq
-        ]
+        for chunk in tqdm(byte_sequences, desc="Encoding text", unit="chunks"):
+            encoded.extend(
+                self.__encode_chunk(chunk)
+            )
+
+        return encoded
 
     def decode(self, ids: list[int]) -> str:
         bytes_seq = b"".join(
