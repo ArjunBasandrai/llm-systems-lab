@@ -17,6 +17,7 @@ class BPETokenizer:
         self.merges: dict[tuple[int, int], int] = {}
 
         self.merge_ranks: dict[tuple[int, int], int] = {}
+        self.encode_cache: dict[bytes, tuple[int, ...]] = {}
 
         self.training_time: float | None = None
         self.training_text_bytes: int | None = None
@@ -64,13 +65,22 @@ class BPETokenizer:
 
         return merged_sequence
 
+    def __invalidate_encode_cache(self) -> None:
+        self.encode_cache.clear()
+
     def __rebuild_merge_ranks(self) -> None:
         self.merge_ranks = {
             pair: rank
             for rank, pair in enumerate(self.merges)
         }
+        self.__invalidate_encode_cache()
 
     def __encode_chunk(self, chunk: bytes) -> list[int]:
+        cached = self.encode_cache.get(chunk)
+
+        if cached is not None:
+            return list(cached)
+
         sequence = list(chunk)
 
         while len(sequence) >= 2:
@@ -98,10 +108,13 @@ class BPETokenizer:
                 new_token_id,
             )
 
+        self.encode_cache[chunk] = tuple(sequence)
+
         return sequence
 
     def train(self, text: str) -> None:
         start_time = time.perf_counter()
+        self.__invalidate_encode_cache()
 
         byte_sequences = self.__pre_tokenize(text)
         chunk_counts = Counter(byte_sequences)
@@ -144,6 +157,7 @@ class BPETokenizer:
 
                 pbar.update(1)
 
+        self.__rebuild_merge_ranks()
         self.training_time = time.perf_counter() - start_time
 
     def encode(self, text: str) -> list[int]:
@@ -151,18 +165,27 @@ class BPETokenizer:
 
         encoded: list[int] = []
 
-        for chunk in tqdm(byte_sequences, desc="Encoding text", unit="chunks"):
-            encoded.extend(
-                self.__encode_chunk(chunk)
-            )
+        for chunk in tqdm(
+            byte_sequences,
+            total=len(byte_sequences),
+            desc="Encoding text",
+            unit="chunks",
+        ):
+            encoded.extend(self.__encode_chunk(chunk))
 
         return encoded
 
     def decode(self, ids: list[int]) -> str:
         bytes_seq = b"".join(
             self.vocab[token_id]
-            for token_id in ids
+            for token_id in tqdm(
+                ids,
+                total=len(ids),
+                desc="Decoding tokens",
+                unit="tokens",
+            )
         )
+
         return bytes_seq.decode("utf-8")
 
     def save(self, path: str | Path) -> None:
@@ -215,5 +238,11 @@ class BPETokenizer:
             (left_id, right_id): new_token_id
             for left_id, right_id, new_token_id in data["merges"]
         }
+
+        tokenizer.__rebuild_merge_ranks()
+
+        metadata = data.get("metadata", {})
+        tokenizer.training_time = metadata.get("training_time_seconds")
+        tokenizer.training_text_bytes = metadata.get("training_text_bytes")
 
         return tokenizer

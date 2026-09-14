@@ -4,7 +4,7 @@ from bpe.bpe import BPETokenizer
 
 
 DATA_PATH = Path("../data/wikitext-10mb.txt")
-VOCAB_SIZE = 500
+VOCAB_SIZE = 8000
 
 
 def load_training_text(path: Path) -> str:
