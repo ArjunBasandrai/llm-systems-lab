@@ -1,0 +1,21 @@
+[project]
+name = "bpe"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Arjun Basandrai", email = "arjunbasandrai2004@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=5.0.1",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+train = "bpe.train:main"
+test = "bpe.test:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
