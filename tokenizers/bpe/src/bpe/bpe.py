@@ -1,12 +1,26 @@
 from collections import Counter, OrderedDict, defaultdict
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import heapq
 import json
+import os
 from pathlib import Path
 import time
 from datetime import datetime, timezone
 
 from tqdm import tqdm
 import regex
+
+
+_WORKER_PATTERN = None
+
+
+def _init_pretoken_worker(pattern: str) -> None:
+    global _WORKER_PATTERN
+    _WORKER_PATTERN = regex.compile(pattern)
+
+
+def _count_pretokens_block(text: str) -> Counter:
+    return Counter(_WORKER_PATTERN.findall(text))
 
 
 class BPETokenizer:
@@ -18,6 +32,13 @@ class BPETokenizer:
         r"|\s+(?!\S)"
         r"|\s+"
     )
+
+    PRETOKEN_WORKERS = max(
+        1,
+        min(8, os.cpu_count() or 1),
+    )
+
+    PRETOKEN_BLOCK_BYTES = 4 * 1024 * 1024
 
     def __init__(
         self,
@@ -50,8 +71,8 @@ class BPETokenizer:
 
     def __pre_tokenize(self, text: str) -> list[bytes]:
         return [
-            match.group(0).encode("utf-8")
-            for match in self._pattern.finditer(text)
+            part.encode("utf-8")
+            for part in self._pattern.findall(text)
         ]
 
     def __merge_pair(
@@ -228,6 +249,162 @@ class BPETokenizer:
 
         return None
 
+    def __iter_file_blocks(
+        self,
+        path: Path,
+    ):
+        carry = b""
+
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(
+                    self.PRETOKEN_BLOCK_BYTES
+                )
+
+                if not chunk:
+                    break
+
+                data = carry + chunk
+
+                split_at = data.rfind(b"\n\n")
+
+                if split_at >= 0:
+                    end = split_at + 2
+
+                elif (
+                    len(data)
+                    >= self.PRETOKEN_BLOCK_BYTES * 4
+                ):
+                    split_at = data.rfind(b"\n")
+
+                    if split_at < 0:
+                        carry = data
+                        continue
+
+                    end = split_at + 1
+
+                else:
+                    carry = data
+                    continue
+
+                block = data[:end]
+                carry = data[end:]
+
+                yield (
+                    block.decode("utf-8"),
+                    len(block),
+                )
+
+        if carry:
+            yield (
+                carry.decode("utf-8"),
+                len(carry),
+            )
+
+    def __count_file_pretokens(
+        self,
+        path: Path,
+        pbar: tqdm,
+        progress_units: float,
+    ) -> Counter:
+        file_size = max(
+            path.stat().st_size,
+            1,
+        )
+
+        chunk_counts = Counter()
+        processed_bytes = 0
+        reported = 0.0
+
+        workers = self.PRETOKEN_WORKERS
+
+        if workers == 1:
+            for block, block_bytes in self.__iter_file_blocks(path):
+                chunk_counts.update(
+                    self._pattern.findall(block)
+                )
+
+                processed_bytes += block_bytes
+
+                target = progress_units * min(
+                    processed_bytes / file_size,
+                    1.0,
+                )
+
+                if target > reported:
+                    pbar.update(
+                        target - reported
+                    )
+                    reported = target
+
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_pretoken_worker,
+                initargs=(self.pre_token_pattern,),
+            ) as executor:
+                blocks = iter(
+                    self.__iter_file_blocks(path)
+                )
+
+                pending = {}
+
+                def submit_next() -> bool:
+                    try:
+                        block, block_bytes = next(blocks)
+                    except StopIteration:
+                        return False
+
+                    future = executor.submit(
+                        _count_pretokens_block,
+                        block,
+                    )
+
+                    pending[future] = block_bytes
+
+                    return True
+
+                for _ in range(workers * 2):
+                    if not submit_next():
+                        break
+
+                while pending:
+                    done, _ = wait(
+                        pending,
+                        return_when=FIRST_COMPLETED,
+                    )
+
+                    for future in done:
+                        block_bytes = pending.pop(
+                            future
+                        )
+
+                        chunk_counts.update(
+                            future.result()
+                        )
+
+                        processed_bytes += block_bytes
+
+                        target = progress_units * min(
+                            processed_bytes / file_size,
+                            1.0,
+                        )
+
+                        if target > reported:
+                            pbar.update(
+                                target - reported
+                            )
+                            reported = target
+
+                        submit_next()
+
+        if reported < progress_units:
+            pbar.update(
+                progress_units - reported
+            )
+
+        return chunk_counts
+
     def __train_from_chunk_counts(
         self,
         chunk_counts: Counter,
@@ -249,7 +426,9 @@ class BPETokenizer:
             for _, frequency in items
         ]
 
-        pbar.set_postfix_str("building pair statistics")
+        pbar.set_postfix_str(
+            "building pair statistics"
+        )
 
         pair_counts, pair_to_sequences = (
             self.__build_pair_stats(
@@ -317,7 +496,9 @@ class BPETokenizer:
             changed_pairs = set()
 
             for sequence_index in affected_sequences:
-                old_sequence = sequences[sequence_index]
+                old_sequence = sequences[
+                    sequence_index
+                ]
 
                 old_local_counts = Counter(
                     zip(
@@ -339,7 +520,9 @@ class BPETokenizer:
                     )
                 )
 
-                frequency = frequencies[sequence_index]
+                frequency = frequencies[
+                    sequence_index
+                ]
 
                 local_pairs = (
                     old_local_counts.keys()
@@ -363,7 +546,10 @@ class BPETokenizer:
                         ) * frequency
 
                         updated_count = (
-                            pair_counts.get(pair, 0)
+                            pair_counts.get(
+                                pair,
+                                0,
+                            )
                             + delta
                         )
 
@@ -379,9 +565,14 @@ class BPETokenizer:
 
                         changed_pairs.add(pair)
 
-                    if old_count > 0 and new_count == 0:
+                    if (
+                        old_count > 0
+                        and new_count == 0
+                    ):
                         sequence_ids = (
-                            pair_to_sequences.get(pair)
+                            pair_to_sequences.get(
+                                pair
+                            )
                         )
 
                         if sequence_ids is not None:
@@ -395,7 +586,10 @@ class BPETokenizer:
                                     None,
                                 )
 
-                    elif old_count == 0 and new_count > 0:
+                    elif (
+                        old_count == 0
+                        and new_count > 0
+                    ):
                         pair_to_sequences[pair].add(
                             sequence_index
                         )
@@ -405,7 +599,10 @@ class BPETokenizer:
                 )
 
             for pair in changed_pairs:
-                count = pair_counts.get(pair, 0)
+                count = pair_counts.get(
+                    pair,
+                    0,
+                )
 
                 if count > 0:
                     heapq.heappush(
@@ -418,20 +615,25 @@ class BPETokenizer:
 
             if (
                 completed_merges % 100 == 0
-                or completed_merges == total_merges
+                or completed_merges
+                == total_merges
             ):
                 pbar.set_postfix_str(
                     f"learning merges "
-                    f"{completed_merges:,}/{total_merges:,}"
+                    f"{completed_merges:,}/"
+                    f"{total_merges:,}"
                 )
 
         remaining_progress = (
             merge_progress
-            - completed_merges * progress_per_merge
+            - completed_merges
+            * progress_per_merge
         )
 
         if remaining_progress > 0:
-            pbar.update(remaining_progress)
+            pbar.update(
+                remaining_progress
+            )
 
         self.__rebuild_merge_ranks()
 
@@ -449,32 +651,23 @@ class BPETokenizer:
             dynamic_ncols=True,
             smoothing=0.1,
         ) as pbar:
-            pbar.set_postfix_str("pre-tokenizing")
+            pbar.set_postfix_str(
+                "pre-tokenizing"
+            )
 
-            chunk_counts = Counter()
+            string_chunk_counts = Counter(
+                self._pattern.findall(text)
+            )
 
-            total_chars = max(len(text), 1)
-            reported = 0.0
+            chunk_counts = Counter({
+                chunk.encode("utf-8"): frequency
+                for chunk, frequency
+                in string_chunk_counts.items()
+            })
 
-            for match_index, match in enumerate(
-                self._pattern.finditer(text)
-            ):
-                chunk = match.group(0).encode("utf-8")
-                chunk_counts[chunk] += 1
-
-                if match_index % 10_000 == 0:
-                    target = pretoken_progress * (
-                        match.end() / total_chars
-                    )
-
-                    if target > reported:
-                        pbar.update(target - reported)
-                        reported = target
-
-            if reported < pretoken_progress:
-                pbar.update(
-                    pretoken_progress - reported
-                )
+            pbar.update(
+                pretoken_progress
+            )
 
             self.training_text_bytes = len(
                 text.encode("utf-8")
@@ -510,14 +703,6 @@ class BPETokenizer:
         pair_stats_progress = 5.0
         merge_progress = 90.0
 
-        file_size = max(
-            path.stat().st_size,
-            1,
-        )
-
-        chunk_counts = Counter()
-        training_text_bytes = 0
-
         with tqdm(
             total=100.0,
             desc="Training tokenizer",
@@ -525,45 +710,31 @@ class BPETokenizer:
             dynamic_ncols=True,
             smoothing=0.1,
         ) as pbar:
-            pbar.set_postfix_str("pre-tokenizing")
+            pbar.set_postfix_str(
+                f"pre-tokenizing "
+                f"({self.PRETOKEN_WORKERS} workers)"
+            )
 
-            reported = 0.0
-
-            with path.open(
-                "r",
-                encoding="utf-8",
-                newline="",
-            ) as f:
-                for line in f:
-                    line_bytes = len(
-                        line.encode("utf-8")
-                    )
-
-                    training_text_bytes += line_bytes
-
-                    chunk_counts.update(
-                        match.group(0).encode("utf-8")
-                        for match in self._pattern.finditer(line)
-                    )
-
-                    target = pretoken_progress * min(
-                        training_text_bytes / file_size,
-                        1.0,
-                    )
-
-                    if target - reported >= 0.01:
-                        pbar.update(
-                            target - reported
-                        )
-                        reported = target
-
-            if reported < pretoken_progress:
-                pbar.update(
-                    pretoken_progress - reported
+            string_chunk_counts = (
+                self.__count_file_pretokens(
+                    path,
+                    pbar,
+                    pretoken_progress,
                 )
+            )
+
+            pbar.set_postfix_str(
+                "encoding unique pre-tokens"
+            )
+
+            chunk_counts = Counter({
+                chunk.encode("utf-8"): frequency
+                for chunk, frequency
+                in string_chunk_counts.items()
+            })
 
             self.training_text_bytes = (
-                training_text_bytes
+                path.stat().st_size
             )
 
             self.__train_from_chunk_counts(
@@ -655,7 +826,9 @@ class BPETokenizer:
                     self.training_text_bytes
                 ),
                 "num_merges": len(self.merges),
-                "actual_vocab_size": len(self.vocab),
+                "actual_vocab_size": len(
+                    self.vocab
+                ),
                 "saved_at": datetime.now(
                     timezone.utc
                 ).isoformat(),
